@@ -84,7 +84,8 @@ class VectorStore:
         self,
         query_embedding: List[float],
         n_results: int = 5,
-        filter_metadata: Optional[Dict] = None
+        filter_metadata: Optional[Dict] = None,
+        filter_sources: Optional[List[str]] = None
     ) -> List[Dict]:
         """
         Search for similar documents.
@@ -92,13 +93,23 @@ class VectorStore:
         Args:
             query_embedding: Query embedding vector
             n_results: Number of results to return
-            filter_metadata: Optional metadata filter
+            filter_metadata: Optional metadata filter (dict)
+            filter_sources: Optional list of source names to filter by
         
         Returns:
             List of dictionaries with 'text', 'metadata', 'distance', and 'id'
         """
         # Build where clause for filtering
-        where = filter_metadata if filter_metadata else None
+        where = None
+        if filter_sources and len(filter_sources) > 0:
+            # Filter by multiple sources using $or operator (ChromaDB syntax)
+            if len(filter_sources) == 1:
+                where = {"source": filter_sources[0]}
+            else:
+                # Use $or to match any of the sources
+                where = {"$or": [{"source": source} for source in filter_sources]}
+        elif filter_metadata:
+            where = filter_metadata
         
         # Perform search
         results = self.collection.query(

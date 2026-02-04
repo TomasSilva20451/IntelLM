@@ -53,6 +53,8 @@ if 'embedding_type' not in st.session_state:
     st.session_state.embedding_type = "local"  # Default to free local embeddings
 if 'local_embedding_model' not in st.session_state:
     st.session_state.local_embedding_model = "all-MiniLM-L6-v2"
+if 'selected_documents' not in st.session_state:
+    st.session_state.selected_documents = []  # List of selected document names
 
 
 def initialize_components():
@@ -132,11 +134,15 @@ def initialize_components():
         # Initialize RAG chain
         if st.session_state.rag_chain is None:
             top_k = st.session_state.get('top_k', 5)
+            # Similarity threshold: chunks with cosine distance > 0.7 are considered not relevant
+            # Lower threshold = stricter (only very similar chunks), Higher threshold = more lenient
+            similarity_threshold = st.session_state.get('similarity_threshold', 0.7)
             st.session_state.rag_chain = RAGChain(
                 vector_store=st.session_state.vector_store,
                 embedding_generator=st.session_state.embedding_generator,
                 llm_client=st.session_state.llm_client,
-                top_k=top_k
+                top_k=top_k,
+                similarity_threshold=similarity_threshold
             )
         
         return True
@@ -267,6 +273,67 @@ def main():
                 st.rerun()
         
         st.divider()
+        
+        # Document selection for filtering
+        if st.session_state.vector_store and st.session_state.vector_store.get_collection_size() > 0:
+            try:
+                available_sources = st.session_state.vector_store.get_unique_sources()
+                if available_sources:
+                    st.subheader("📋 Select Documents for Context")
+                    st.caption("Choose which documents to use when answering questions. Leave unchecked to use all documents.")
+                    
+                    # Initialize selected_documents if not set or if sources changed
+                    if 'selected_documents' not in st.session_state:
+                        st.session_state.selected_documents = []
+                    
+                    # Remove any selected documents that no longer exist
+                    st.session_state.selected_documents = [
+                        doc for doc in st.session_state.selected_documents 
+                        if doc in available_sources
+                    ]
+                    
+                    # Create checkboxes for each document
+                    selected_docs = []
+                    
+                    for source in available_sources:
+                        # Check if this document is currently selected
+                        is_selected = source in st.session_state.selected_documents
+                        
+                        # Get chunk count for this source
+                        all_docs = st.session_state.vector_store.get_all_documents()
+                        chunk_count = len([
+                            doc for doc in all_docs
+                            if doc.get('metadata', {}).get('source') == source
+                        ])
+                        
+                        # Create checkbox with document name and chunk count
+                        checkbox_key = f"doc_checkbox_{source}"
+                        checked = st.checkbox(
+                            f"📄 {source}",
+                            value=is_selected,
+                            key=checkbox_key,
+                            help=f"{chunk_count} chunk(s)"
+                        )
+                        
+                        if checked:
+                            selected_docs.append(source)
+                    
+                    # Update session state only if selection actually changed
+                    # This prevents unnecessary reruns that might affect chat history
+                    previous_selection = st.session_state.get('selected_documents', [])
+                    if set(selected_docs) != set(previous_selection):
+                        st.session_state.selected_documents = selected_docs
+                        # Note: We don't clear chat_history here - conversation continues!
+                    
+                    # Show filter status
+                    if st.session_state.selected_documents:
+                        st.info(f"🔍 **Filtering active:** {len(st.session_state.selected_documents)} document(s) selected")
+                    else:
+                        st.info("ℹ️ **No filter:** Using all documents")
+                    
+                    st.divider()
+            except Exception as e:
+                st.warning(f"Could not load document list: {str(e)}")
         
         # Rate limit settings
         st.subheader("💰 Rate Limiting")
@@ -554,13 +621,36 @@ def main():
     st.subheader("💬 Ask Questions")
     
     # Display chat history
-    for i, (question, answer, sources) in enumerate(st.session_state.chat_history):
+    for i, entry in enumerate(st.session_state.chat_history):
+        # Handle different formats: 3 items (old), 4 items (previous), 5 items (new with knowledge_source)
+        if len(entry) == 3:
+            question, answer, sources = entry
+            used_documents = None
+            knowledge_source = 'documents'  # Default assumption for old entries
+        elif len(entry) == 4:
+            question, answer, sources, used_documents = entry
+            knowledge_source = 'documents'  # Default assumption for entries without knowledge_source
+        else:
+            question, answer, sources, used_documents, knowledge_source = entry
+        
         with st.chat_message("user"):
             st.write(question)
         
         with st.chat_message("assistant"):
             st.write(answer)
-            if sources:
+            
+            # Show knowledge source indicator
+            if knowledge_source == 'general_knowledge':
+                st.caption("🌍 **General knowledge** (no relevant documents found)")
+            else:
+                st.caption("📄 **Answer based on documents**")
+            
+            # Show which documents were used for filtering (if documents mode)
+            if knowledge_source == 'documents' and used_documents:
+                st.caption(f"📋 Used documents: {', '.join(used_documents[:3])}{'...' if len(used_documents) > 3 else ''}")
+            
+            # Show sources (only if documents were used)
+            if knowledge_source == 'documents' and sources:
                 with st.expander("📚 Sources"):
                     for source in sources:
                         st.write(f"- {source}")
@@ -584,64 +674,93 @@ def main():
                     temperature = st.session_state.get('temperature', 0.5)
                     top_k = st.session_state.get('top_k', 5)
                     
-                    # Check if user is asking about a specific document
-                    filter_document = st.session_state.rag_chain._extract_document_name_from_query(question)
-                    if filter_document:
-                        st.info(f"🔍 Filtering results to: **{filter_document}**")
+                    # Get selected documents for filtering
+                    # IMPORTANT: Only use filter if documents are actually selected
+                    # Empty list means "use all documents" - don't filter
+                    selected_docs = st.session_state.get('selected_documents', [])
+                    filter_sources = selected_docs if selected_docs else None  # None = use all documents
                     
-                    if use_streaming:
-                        # Streaming response - first retrieve chunks to get sources
-                        filter_metadata = None
+                    if filter_sources:
+                        st.info(f"🔍 **Using selected documents:** {', '.join(filter_sources[:3])}{'...' if len(filter_sources) > 3 else ''}")
+                    else:
+                        st.info("ℹ️ **No filter:** Searching across all documents")
+                    
+                    # Check if user is asking about a specific document (only if no manual selection)
+                    filter_document = None
+                    if not filter_sources:
+                        filter_document = st.session_state.rag_chain._extract_document_name_from_query(question)
+                        if filter_document:
+                            st.info(f"🔍 Auto-detected document: **{filter_document}**")
+                    
+                    # Check if chunks will be retrieved (to determine knowledge_source for streaming)
+                    query_embedding = st.session_state.rag_chain.embedding_generator.generate_embedding(question)
+                    filter_metadata = None
+                    if not filter_sources:
+                        filter_document = st.session_state.rag_chain._extract_document_name_from_query(question)
                         if filter_document:
                             filter_metadata = {"source": filter_document}
+                    
+                    preview_chunks = st.session_state.rag_chain.vector_store.search(
+                        query_embedding=query_embedding,
+                        n_results=top_k,
+                        filter_metadata=filter_metadata,
+                        filter_sources=filter_sources
+                    )
+                    # Check similarity threshold to determine if chunks are relevant
+                    similarity_threshold = st.session_state.rag_chain.similarity_threshold
+                    relevant_preview_chunks = []
+                    if preview_chunks:
+                        best_distance = preview_chunks[0].get('distance')
+                        if best_distance is not None and best_distance <= similarity_threshold:
+                            relevant_preview_chunks = [chunk for chunk in preview_chunks 
+                                                      if chunk.get('distance') is None or chunk.get('distance') <= similarity_threshold]
+                    knowledge_source = 'general_knowledge' if not preview_chunks or not relevant_preview_chunks else 'documents'
+                    
+                    if use_streaming:
+                        # Streaming response
+                        answer_placeholder = st.empty()
+                        full_answer = ""
                         
-                        query_embedding = st.session_state.rag_chain.embedding_generator.generate_embedding(question)
-                        retrieved_chunks = st.session_state.rag_chain.vector_store.search(
-                            query_embedding=query_embedding,
-                            n_results=top_k,
-                            filter_metadata=filter_metadata
-                        )
-                        
-                        if retrieved_chunks:
-                            sources = list(set([chunk.get('metadata', {}).get('source', 'Unknown') for chunk in retrieved_chunks]))
-                            chunks = retrieved_chunks
-                            
-                            # Stream the response
-                            answer_placeholder = st.empty()
-                            full_answer = ""
-                            
-                            with st.spinner("Generating response..."):
-                                try:
-                                    for chunk in st.session_state.rag_chain.query_stream(
-                                        question=question,
-                                        top_k=top_k,
-                                        temperature=temperature,
-                                        max_tokens=max_tokens
-                                    ):
-                                        full_answer += chunk
-                                        answer_placeholder.write(full_answer + "▌")
-                                    
-                                    answer_placeholder.write(full_answer)
-                                    answer = full_answer
-                                    
-                                except Exception as e:
-                                    st.error(f"Error during streaming: {str(e)}")
-                                    # Fallback to non-streaming
-                                    result = st.session_state.rag_chain.query(
-                                        question=question,
-                                        top_k=top_k,
-                                        temperature=temperature,
-                                        max_tokens=max_tokens
-                                    )
-                                    answer = result['answer']
-                                    sources = result['sources']
-                                    chunks = result['chunks']
-                                    st.write(answer)
+                        # Show knowledge source indicator
+                        if knowledge_source == 'documents':
+                            st.info("📄 **Answer based on documents**")
                         else:
-                            answer = "I couldn't find any relevant information in the documents to answer your question."
-                            sources = []
-                            chunks = []
-                            st.write(answer)
+                            st.info("🌍 **Answer using general knowledge** (no relevant documents found)")
+                        
+                        with st.spinner("Generating response..."):
+                            try:
+                                for chunk in st.session_state.rag_chain.query_stream(
+                                    question=question,
+                                    top_k=top_k,
+                                    temperature=temperature,
+                                    max_tokens=max_tokens,
+                                    filter_sources=filter_sources  # Already None if no selection
+                                ):
+                                    full_answer += chunk
+                                    answer_placeholder.write(full_answer + "▌")
+                                
+                                answer_placeholder.write(full_answer)
+                                answer = full_answer
+                                
+                                # Use preview chunks for sources display
+                                sources = list(set([chunk.get('metadata', {}).get('source', 'Unknown') for chunk in preview_chunks]))
+                                chunks = preview_chunks
+                                
+                            except Exception as e:
+                                st.error(f"Error during streaming: {str(e)}")
+                                # Fallback to non-streaming
+                                result = st.session_state.rag_chain.query(
+                                    question=question,
+                                    top_k=top_k,
+                                    temperature=temperature,
+                                    max_tokens=max_tokens,
+                                    filter_sources=filter_sources  # Already None if no selection
+                                )
+                                answer = result['answer']
+                                sources = result['sources']
+                                chunks = result['chunks']
+                                knowledge_source = result.get('knowledge_source', 'documents')
+                                st.write(answer)
                     else:
                         # Non-streaming response
                         with st.spinner("Thinking..."):
@@ -649,31 +768,40 @@ def main():
                                 question=question,
                                 top_k=top_k,
                                 temperature=temperature,
-                                max_tokens=max_tokens
+                                max_tokens=max_tokens,
+                                filter_sources=filter_sources  # Already None if no selection
                             )
-                            # Note: filter_document is already extracted above and used in query()
                             answer = result['answer']
                             sources = result['sources']
                             chunks = result['chunks']
+                            knowledge_source = result.get('knowledge_source', 'documents')
+                            
+                            # Show knowledge source indicator
+                            if knowledge_source == 'documents':
+                                st.info("📄 **Answer based on documents**")
+                            else:
+                                st.info("🌍 **Answer using general knowledge** (no relevant documents found)")
                             
                             st.write(answer)
                     
-                    # Show sources
-                    if sources:
+                    # Show sources (only if documents were used)
+                    if knowledge_source == 'documents' and sources:
                         with st.expander("📚 Sources"):
                             for source in sources:
                                 st.write(f"- {source}")
                     
-                    # Show retrieved chunks
-                    with st.expander("🔍 Retrieved Chunks"):
-                        for i, chunk in enumerate(chunks, 1):
-                            metadata = chunk.get('metadata', {})
-                            source = metadata.get('source', 'Unknown')
-                            st.markdown(f"**Chunk {i}** - {source}")
-                            st.text(chunk.get('text', '')[:200] + "...")
+                    # Show retrieved chunks (only if documents were used)
+                    if knowledge_source == 'documents' and chunks:
+                        with st.expander("🔍 Retrieved Chunks"):
+                            for i, chunk in enumerate(chunks, 1):
+                                metadata = chunk.get('metadata', {})
+                                source = metadata.get('source', 'Unknown')
+                                st.markdown(f"**Chunk {i}** - {source}")
+                                st.text(chunk.get('text', '')[:200] + "...")
                     
-                    # Add to chat history
-                    st.session_state.chat_history.append((question, answer, sources))
+                    # Add to chat history with document selection info and knowledge source
+                    used_documents = filter_sources if filter_sources else ["All documents"]
+                    st.session_state.chat_history.append((question, answer, sources, used_documents, knowledge_source))
                         
                 except Exception as e:
                     error_msg = str(e)
