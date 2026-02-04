@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables (IMPORTANT: Don't commit API keys!)
+.env
+.env.local
+.env.*.local
+
+# Data directories (contain user data)
+data/
+chroma_db/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Docker volumes
+*.db
+*.sqlite
+
+# Model cache (sentence-transformers downloads)
+.cache/
+
+# Temporary files
+*.tmp
+*.temp
